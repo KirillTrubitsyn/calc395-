@@ -3,9 +3,15 @@ import datetime as dt
 from typing import List, Tuple, Optional
 import httpx
 
-# Fallback table of key-rate steps (date_from, rate_percent).
-# Keep empty by default; prefer providing RATES_URL for authoritative data.
 DEFAULT_RATE_STEPS: List[Tuple[dt.date, float]] = []
+
+def _normalize_headers(cols):
+    # strip BOM and whitespace, lowercase
+    norm = []
+    for c in cols:
+        cc = str(c).strip().lower().replace("\ufeff", "")
+        norm.append(cc)
+    return norm
 
 class RatesProvider:
     def __init__(
@@ -13,11 +19,6 @@ class RatesProvider:
         source_url: Optional[str] = None,
         refresh_seconds: int = 6 * 60 * 60,
     ):
-        """
-        source_url: Public JSON/CSV/TSV with columns:
-           - date_from (YYYY-MM-DD)
-           - key_rate (float, % per annum)
-        """
         self.source_url = source_url
         self.refresh_seconds = refresh_seconds
         self._cache: List[Tuple[dt.date, float]] = []
@@ -32,28 +33,52 @@ class RatesProvider:
             r.raise_for_status()
             text = r.text
 
-        # Try CSV/TSV/JSON using pandas
         import pandas as pd
         from io import StringIO
         sio = StringIO(text)
+
+        # Try CSV first
         try:
-            if self.source_url.endswith(".json"):
-                df = pd.read_json(sio)
-            else:
-                df = pd.read_csv(sio)
+            df = pd.read_csv(sio)
         except Exception:
+            # retry TSV
             sio.seek(0)
-            df = pd.read_csv(sio, sep="\\t")
+            try:
+                df = pd.read_csv(sio, sep="\t")
+            except Exception:
+                # try JSON as last resort
+                sio.seek(0)
+                df = pd.read_json(sio)
 
+        # Normalize headers (handle BOM/whitespace/case)
+        df.columns = _normalize_headers(df.columns)
+
+        # Expect columns date_from, key_rate
         if "date_from" not in df.columns or "key_rate" not in df.columns:
-            raise ValueError("Rates file must have columns: date_from, key_rate")
+            raise ValueError("Rates file must have columns: date_from, key_rate (UTF-8 CSV/JSON).")
 
-        steps: List[Tuple[dt.date, float]] = []
-        for _, row in df.iterrows():
-            d = dt.date.fromisoformat(str(row["date_from"])[:10])
-            rate = float(row["key_rate"])
-            steps.append((d, rate))
+        # Clean values
+        df["date_from"] = df["date_from"].astype(str).str.strip().str.replace("\ufeff", "", regex=False)
+        df["key_rate"]  = df["key_rate"].astype(str).str.strip()
 
+        # Replace percent sign and comma decimals
+        df["key_rate"] = df["key_rate"].str.replace("%", "", regex=False)
+        df["key_rate"] = df["key_rate"].str.replace(",", ".", regex=False)
+
+        # Coerce types
+        import pandas as pd
+        df["key_rate"] = pd.to_numeric(df["key_rate"], errors="coerce")
+
+        def parse_date_safe(s):
+            try:
+                return dt.date.fromisoformat(s[:10])
+            except Exception:
+                return None
+        df["date_from"] = df["date_from"].apply(parse_date_safe)
+
+        # Drop invalid rows and sort
+        df = df.dropna(subset=["date_from", "key_rate"])
+        steps: List[Tuple[dt.date, float]] = [(row["date_from"], float(row["key_rate"])) for _, row in df.iterrows()]
         steps.sort(key=lambda x: x[0])
         return steps
 
